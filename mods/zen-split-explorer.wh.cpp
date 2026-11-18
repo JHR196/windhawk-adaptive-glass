@@ -4,7 +4,7 @@
 // @name:zh-CN      ZenDesktop: 文件管理器美化
 // @description     Translucent File Explorer with adjustable tint, transparent chrome, and glass desktop context menus.
 // @description:zh-CN 让 Windows 11 文件管理器整窗半透明模糊，色调可调，命令栏、地址栏、标签栏透明，并美化桌面与资源管理器的右键菜单。
-// @version         1.7.11
+// @version         1.7.12
 // @donateUrl       https://ifdian.net/a/Lanboo
 // @author          Lanbo & m417z
 // @github          https://github.com/Liset999
@@ -84,6 +84,7 @@
 
 ## 更新日志
 
+- **1.7.12（本定制版）**：文件选中时增加半透明蓝灰底和细侧标，窗口失焦后降低强度；不改变悬停和窗口玻璃。
 - **1.7.11**：修复控制面板顶部位图在透明文件管理器中残留白条的问题，按系统位图内容匹配并清除背景。
 
 
@@ -12858,6 +12859,34 @@ bool PaintThemeBackground(HTHEME hTheme,
          wcsstr(themeClass, L"TreeView"))) {
         RECT rc = *pRect;
         if (pClipRect && !IntersectRect(&rc, &rc, pClipRect)) {
+            return true;
+        }
+        // Only file items, not the navigation tree or generic GDI fills. Anchor
+        // the marker to the full item, so partial repaints never move it.
+        const bool selected = iStateId == 3 || iStateId == 5 || iStateId == 6;
+        if (selected && !wcsstr(themeClass, L"TreeView")) {
+            HIGHCONTRASTW hc{sizeof(hc)};
+            if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0) &&
+                (hc.dwFlags & HCF_HIGHCONTRASTON)) return false;
+            const bool dark = g_zenDarkContent.load(std::memory_order_relaxed);
+            const bool inactive = iStateId == 5;
+            COLORREF wash = dark ? RGB(153,186,212) : RGB(64,114,154);
+            BYTE opacity = inactive ? 46 : iStateId == 6 ? 93 : 79;
+            FillRect_Original(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+            if (!FillRectWithAlpha(hdc, &rc, wash, opacity)) return false;
+            const HWND w = WindowFromDC(hdc);
+            const DCWnd* mw = w ? nullptr : GetMemoryDCWnd(hdc);
+            const UINT dpi = GetDpiForWindow(w ? w : (mw ? mw->hWnd : nullptr));
+            const LONG width = std::max(2, MulDiv(2, dpi ? dpi : 96, 96));
+            const LONG height = pRect->bottom - pRect->top;
+            if (height >= width * 3 && pRect->right - pRect->left >= width * 4) {
+                const LONG pad = std::min(height / 4, width * 2);
+                RECT mark{pRect->left, pRect->top + pad, pRect->left + width,
+                          pRect->bottom - pad};
+                if (IntersectRect(&mark, &mark, &rc))
+                    FillRectWithAlpha(hdc, &mark, dark ? RGB(174,207,230) : RGB(42,89,125),
+                                      inactive ? 120 : 209);
+            }
             return true;
         }
         FillRect_Original(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
