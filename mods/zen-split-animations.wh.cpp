@@ -4,7 +4,7 @@
 // @name:zh-CN      ZenDesktop: 窗口动画
 // @description     Close, minimize, restore, launch and Alt+Tab animations for windows, including the macOS genie effect.
 // @description:zh-CN 为窗口的关闭、最小化、还原、启动和 Alt+Tab 切换加入动画，包含 macOS 神奇效果。
-// @version         1.6.20
+// @version         1.6.24
 // @author          ReDrag, Abdullah Masood, Potassiumuncher, Lanbo
 // @github          https://github.com/redrag2105
 // @donateUrl       https://ko-fi.com/redrag2105
@@ -460,6 +460,7 @@ itself is by **ReDrag** (MIT). Copyright of each part remains with its author.
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <appmodel.h>
 #include <tlhelp32.h>
 // BEGIN embedded zen-game-guard.h
 // Windhawk compiles stdin; keep this block synced with tools/sync_animation_guard.py.
@@ -5215,6 +5216,19 @@ DWORD WINAPI UiaWorkerThread(LPVOID lpParam) {
                         wchar_t exe[32768]; DWORD n = GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
                         if (n && n < ARRAYSIZE(exe)) exeId.assign(exe,n);
                     }
+                    // A packaged Terminal uses its implicit package AUMID. Its
+                    // localized taskbar label need not contain the title or exe name.
+                    std::wstring terminalId;
+                    if (t->procNameLower == L"windowsterminal" && ownerPid) {
+                        HANDLE owner = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ownerPid);
+                        if (owner) {
+                            wchar_t id[256]{};
+                            UINT32 length = ARRAYSIZE(id);
+                            if (GetApplicationUserModelId(owner, &length, id) == ERROR_SUCCESS)
+                                terminalId = id;
+                            CloseHandle(owner);
+                        }
+                    }
                     if (pOrCond && SUCCEEDED(batch ? pTrayElement->FindAllBuildCache(TreeScope_Descendants, pOrCond, cache.Get(), &pArray) : pTrayElement->FindAll(TreeScope_Descendants, pOrCond, &pArray)) && pArray) {
                         int length = 0;
                         pArray->get_Length(&length);
@@ -5281,10 +5295,10 @@ DWORD WINAPI UiaWorkerThread(LPVOID lpParam) {
                                         if (uiaNameLower.find(L"search") != std::wstring::npos) score -= 500;
                                         if (uiaNameLower.find(L"task view") != std::wstring::npos) score -= 500;
                                         if (uiaNameLower.find(L"widgets") != std::wstring::npos) score -= 500;
-                                        if (batch) {
+                                        if (batch || !terminalId.empty()) {
                                             BSTR aid = nullptr;
-                                            if (SUCCEEDED(pItem->get_CachedAutomationId(&aid)) && aid && !_wcsnicmp(aid,L"Appid: ",7) &&
-                                                ((!explicitId.empty() && !_wcsicmp(aid+7,explicitId.c_str())) || (!exeId.empty() && !_wcsicmp(aid+7,exeId.c_str())))) score += 5000;
+                                            if (SUCCEEDED(batch ? pItem->get_CachedAutomationId(&aid) : pItem->get_CurrentAutomationId(&aid)) && aid && !_wcsnicmp(aid,L"Appid: ",7) &&
+                                                ((!terminalId.empty() && !_wcsicmp(aid+7,terminalId.c_str())) || (!explicitId.empty() && !_wcsicmp(aid+7,explicitId.c_str())) || (!exeId.empty() && !_wcsicmp(aid+7,exeId.c_str())))) score += 5000;
                                             SysFreeString(aid);
                                         }
                                         if (score >= AnimConstants::UiaMinAcceptScore && score > bestScore) {
@@ -10395,7 +10409,11 @@ public:
             }
             // If Explorer has not published any button (e.g. a tray-only
             // app), use an in-place transition, never fly to an invented icon.
-            if (!ready()) data->effectStyle = kMinRestoreElasticPop;
+            // Auto-hide or a slow grouped Terminal button is not evidence
+            // that this is a tray-only app. Retain its selected genie and the
+            // previously resolved dock position (monitor edge on a cold miss).
+            if (!ready() && GetClassNameStr(data->hRealWnd) != L"CASCADIA_HOSTING_WINDOW_CLASS")
+                data->effectStyle = kMinRestoreElasticPop;
         }
         const bool horizontalTaskbar =
             IsHorizontalTaskbar(taskbarEdge);
@@ -12651,6 +12669,21 @@ static bool StartAnimationWorker(WindowAnimData* data) {
     return false;
 }
 
+// A composed screen capture cannot recover the app behind the taskbar. Mask
+// only that intersection AFTER making the screen pixels opaque, so the live
+// desktop shows through. Never stretch a row of glyphs into the restore cache.
+static void ClearOccludedSnapshotPixels(DWORD* pixels, const RECT& frame,
+                                        const RECT& occluder) {
+    RECT clipped{};
+    if (!IntersectRect(&clipped, &frame, &occluder)) return;
+    const size_t stride = static_cast<size_t>(frame.right - frame.left);
+    for (LONG y = clipped.top; y < clipped.bottom; ++y) {
+        DWORD* row = pixels + static_cast<size_t>(y - frame.top) * stride;
+        std::fill(row + (clipped.left - frame.left),
+                  row + (clipped.right - frame.left), DWORD{0});
+    }
+}
+
 bool StartAnimation(HWND hWnd, BOOL rising, LONG_PTR originalExStyle, BOOL cloakHidden = FALSE,
                     BOOL isClosing = FALSE, UINT closeMsg = 0, HANDLE hWaitFinish = NULL,
                     BOOL deferredMinimize = FALSE, BOOL requestedUnhide = FALSE, HWND hNextApp = NULL,
@@ -13045,11 +13078,15 @@ bool StartAnimation(HWND hWnd, BOOL rising, LONG_PTR originalExStyle, BOOL cloak
     const bool excelCloseScreenOnlyCapture =
         RequiresExcelScreenOnlyCloseCapture(hWnd, isClosing);
     const bool composedWindowSnapshot = RequiresComposedWindowSnapshot(hWnd);
+    // A terminal can successfully PrintWindow its frame without drawing its
+    // GPU-rendered client. On minimize, use the visible composed window or let
+    // Windows minimize normally; never cache a frame-only or occluded image.
+    const bool terminalMinimize = !rising && !isClosing && RequiresScreenCapture(hWnd);
     const bool screenOnlyCapture =
-        excelCloseScreenOnlyCapture || RequiresShellComposedWindowSnapshot(hWnd) ||
+        terminalMinimize || excelCloseScreenOnlyCapture || RequiresShellComposedWindowSnapshot(hWnd) ||
         (isClosing && RequiresScreenCapture(hWnd));
     const bool preferScreenCapture =
-        excelCloseScreenOnlyCapture || (!rising && composedWindowSnapshot) ||
+        terminalMinimize || excelCloseScreenOnlyCapture || (!rising && composedWindowSnapshot) ||
         ShouldUseBitBlt(hWnd, isClosing);
     const bool allowShowDesktopSwitchGhostWait =
         !rising && !isClosing && !onTargetThread &&
@@ -13137,6 +13174,10 @@ bool StartAnimation(HWND hWnd, BOOL rising, LONG_PTR originalExStyle, BOOL cloak
                 blockerOwner, blockerRootOwner);
         };
         auto CaptureScreen = [&]() -> BOOL {
+            if (terminalMinimize) {
+                DWORD affinity = 0;
+                if (!GetWindowDisplayAffinity(hWnd, &affinity) || affinity != WDA_NONE) return FALSE;
+            }
             // A screen DC contains the fully composed desktop, not just hWnd.
             // Refuse the fallback when another top-level window contributes
             // pixels above the target. Checking the z-order also catches the
@@ -13264,57 +13305,13 @@ bool StartAnimation(HWND hWnd, BOOL rising, LONG_PTR originalExStyle, BOOL cloak
             captured = CaptureScreen();
             capturedFromScreen = captured != FALSE;
         }
-        if (captured && capturedFromScreen) {
-            GdiFlush();
-            RECT overlap{};
-            if (capturedTaskbarAbove &&
-                IntersectRect(&overlap, &winRect,
-                              &capturedTaskbarRect)) {
-                const int left = Clamp(
-                    static_cast<int>(overlap.left - winRect.left), 0, rawW);
-                const int right = Clamp(
-                    static_cast<int>(overlap.right - winRect.left), 0, rawW);
-                const int top = Clamp(
-                    static_cast<int>(overlap.top - winRect.top), 0, rawH);
-                const int bottom = Clamp(
-                    static_cast<int>(overlap.bottom - winRect.top), 0, rawH);
-                auto* pixels = static_cast<DWORD*>(tempBits);
-                const bool horizontal =
-                    (capturedTaskbarRect.right - capturedTaskbarRect.left) >=
-                    (capturedTaskbarRect.bottom - capturedTaskbarRect.top);
-                const bool trailingEdge = horizontal
-                                              ? capturedTaskbarRect.top >=
-                                                    (mi.rcMonitor.top +
-                                                     mi.rcMonitor.bottom) / 2
-                                              : capturedTaskbarRect.left >=
-                                                    (mi.rcMonitor.left +
-                                                     mi.rcMonitor.right) / 2;
-                if (left < right && top < bottom) {
-                    if (horizontal) {
-                        const int sourceY = trailingEdge
-                                                ? std::max(0, top - 1)
-                                                : std::min(rawH - 1, bottom);
-                        for (int y = top; y < bottom; ++y) {
-                            memcpy(pixels + (size_t)y * rawW + left,
-                                   pixels + (size_t)sourceY * rawW + left,
-                                   (size_t)(right - left) * sizeof(DWORD));
-                        }
-                    } else {
-                        const int sourceX = trailingEdge
-                                                ? std::max(0, left - 1)
-                                                : std::min(rawW - 1, right);
-                        for (int y = top; y < bottom; ++y) {
-                            DWORD* row = pixels + (size_t)y * rawW;
-                            std::fill(row + left, row + right, row[sourceX]);
-                        }
-                    }
-                }
-            }
-        }
         if (captured) {
             GdiFlush();
-            captured = CopySnapshot(tempBits, rawW, rawH,
-                                    capturedFromScreen);
+            captured = CopySnapshot(tempBits, rawW, rawH, capturedFromScreen);
+            if (captured && capturedFromScreen && capturedTaskbarAbove) {
+                ClearOccludedSnapshotPixels(static_cast<DWORD*>(data->pBits),
+                                            rect, capturedTaskbarRect);
+            }
         }
         SelectObject(tempDC, oldBmp);
         DeleteObject(tempBmp);
@@ -13459,11 +13456,12 @@ bool StartAnimation(HWND hWnd, BOOL rising, LONG_PTR originalExStyle, BOOL cloak
                 !onTargetThread && effectStyle == 0 &&
                 g_gpuAcceleration.load(std::memory_order_relaxed) &&
                 !GetSystemMetrics(SM_REMOTESESSION);
+            // A cold Terminal capture can outlast the 200 ms owner-thread handoff.
             const DWORD firstFrameWaitMs =
                 (!rising && !isClosing &&
                  ((effectStyle >= 1 && effectStyle <= 7) ||
                   effectStyle == kMinRestoreMacGenie ||
-                  crossThreadGpuGenie))
+                  terminalMinimize || crossThreadGpuGenie))
                     ? 500
                     : 200;
             if (waitForFirstFrame) {
@@ -14385,7 +14383,8 @@ static MinimizeKick KickMinimizeAnimation(HWND hWnd, bool desktopFocusOnUnhide =
         effectStyle = ResolveMinRestoreEffectStyle();
     }
     const bool genieStyle = MinRestoreEffectRevealsTaskbar(effectStyle);
-    if (allowUnhide && genieStyle && g_unhideEnabled.load(std::memory_order_relaxed)) {
+    // Do not lend foreground to an auto-hidden taskbar before capturing a terminal.
+    if (allowUnhide && genieStyle && !RequiresScreenCapture(hWnd) && g_unhideEnabled.load(std::memory_order_relaxed)) {
         hMon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
         hTray = FindTaskbarForMonitor(hMon);
         if (hTray) {
